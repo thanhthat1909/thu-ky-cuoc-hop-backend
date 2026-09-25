@@ -1,129 +1,306 @@
+import json
 import os
+import random
+import re
+import threading
 import time
+from typing import Any, Optional
+
 from google import genai
 from google.genai import types
-from google.genai.errors import ServerError, APIError
-from config import client
+
+from config import (
+    GEMINI_MAX_RETRIES,
+    GEMINI_MAX_RETRY_WAIT_SECONDS,
+    GEMINI_MODEL,
+    client,
+)
 from schemas import MeetingSummaryResponse
 
-class MeetingService:
-    # Model chuẩn duy nhất được Google cấp phép cho tài khoản của bạn
-    PRIMARY_MODEL = "gemini-3.6-flash"
 
-    @staticmethod
-    def _get_exact_audio_mime_type(file_path: str, fallback_mime: str) -> str:
-        """
-        Xác định MIME type âm thanh chuẩn dựa vào đuôi mở rộng của file.
-        """
-        ext = os.path.splitext(file_path)[1].lower()
-        mime_map = {
-            ".mp3": "audio/mp3",
-            ".m4a": "audio/m4a",
-            ".wav": "audio/wav",
-            ".aac": "audio/aac",
-            ".flac": "audio/flac",
-            ".ogg": "audio/ogg"
-        }
-        return mime_map.get(ext, fallback_mime)
+# Chỉ cho một yêu cầu Gemini xử lý audio chạy tại một thời điểm trên
+# một instance Render. Điều này giúp tránh việc hai điện thoại gửi đồng thời
+# và cùng đẩy project vượt RPM.
+_GEMINI_LOCK = threading.Lock()
 
-    @staticmethod
-    async def process_audio_meeting(file_path: str, mime_type: str) -> MeetingSummaryResponse:
-        """
-        Upload file âm thanh lên Gemini File API và thực hiện tóm tắt cuộc họp.
-        """
-        # 1. Xác định MIME type chuẩn
-        exact_mime = MeetingService._get_exact_audio_mime_type(file_path, mime_type)
 
-        # 2. Upload file âm thanh lên server Gemini
-        uploaded_file = client.files.upload(
-            file=file_path,
-            config=types.UploadFileConfig(mime_type=exact_mime)
+def _exception_text(exc: Exception) -> str:
+    """Lấy thông tin lỗi an toàn từ exception của google-genai."""
+    parts = [str(exc)]
+
+    for attr in ("message", "details", "response"):
+        value = getattr(exc, attr, None)
+        if value:
+            parts.append(str(value))
+
+    return " ".join(parts)
+
+
+def _status_code(exc: Exception) -> Optional[int]:
+    for attr in ("code", "status_code", "status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+
+    text = _exception_text(exc)
+    match = re.search(r"\b(429|408|500|502|503|504)\b", text)
+    return int(match.group(1)) if match else None
+
+
+def _is_retryable(exc: Exception) -> bool:
+    code = _status_code(exc)
+    if code in (408, 429, 500, 502, 503, 504):
+        return True
+
+    text = _exception_text(exc).upper()
+    return any(
+        marker in text
+        for marker in (
+            "RESOURCE_EXHAUSTED",
+            "TOO MANY REQUESTS",
+            "RATE LIMIT",
+            "UNAVAILABLE",
+            "SERVICE UNAVAILABLE",
+        )
+    )
+
+
+def _retry_after_seconds(exc: Exception, attempt: int) -> float:
+    """
+    Ưu tiên thời gian Gemini yêu cầu trong thông báo lỗi:
+    'Please retry in 14.9729s'
+    Nếu không có, dùng exponential backoff + jitter.
+    """
+    text = _exception_text(exc)
+
+    patterns = (
+        r"retry in\s+([0-9]+(?:\.[0-9]+)?)\s*s",
+        r"retry_delay[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+        r"seconds[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return min(
+                float(match.group(1)) + 1.0,
+                GEMINI_MAX_RETRY_WAIT_SECONDS,
+            )
+
+    # 2, 4, 8... giây + jitter.
+    backoff = min(2 ** attempt, GEMINI_MAX_RETRY_WAIT_SECONDS)
+    jitter = random.uniform(0.2, 1.0)
+    return min(backoff + jitter, GEMINI_MAX_RETRY_WAIT_SECONDS)
+
+
+def _looks_like_daily_quota(text: str) -> bool:
+    text = text.lower()
+    return any(
+        marker in text
+        for marker in (
+            "requests per day",
+            "per day",
+            "daily quota",
+            "rpd",
+            "quota will reset",
+        )
+    )
+
+
+def _friendly_gemini_error(exc: Exception) -> RuntimeError:
+    text = _exception_text(exc)
+    code = _status_code(exc)
+
+    if code == 429 or "RESOURCE_EXHAUSTED" in text.upper():
+        if _looks_like_daily_quota(text):
+            return RuntimeError(
+                "Gemini đã hết hạn mức trong ngày của project. "
+                "Vui lòng chờ quota reset hoặc nâng cấp billing/quota "
+                "trong Google AI Studio. File ghi âm trên điện thoại vẫn được giữ."
+            )
+
+        return RuntimeError(
+            "Gemini đang vượt giới hạn yêu cầu tạm thời (429). "
+            "Hệ thống đã tự động thử lại nhưng quota vẫn chưa sẵn sàng. "
+            "Vui lòng đợi khoảng 30–60 giây rồi gửi lại. "
+            "File ghi âm gốc vẫn được giữ trên điện thoại."
         )
 
-        # 3. Vòng lặp chờ Gemini xử lý file (ACTIVE)
-        while True:
-            file_info = client.files.get(name=uploaded_file.name)
-            state_str = str(file_info.state)
-            
-            if "ACTIVE" in state_str:
-                break
-            elif "FAILED" in state_str:
-                raise Exception("Gemini File API gặp lỗi trong quá trình xử lý file âm thanh.")
-            
-            time.sleep(2)
+    if code in (503, 502, 504):
+        return RuntimeError(
+            "Gemini đang quá tải hoặc tạm thời không sẵn sàng. "
+            "Hệ thống đã tự động thử lại. Vui lòng gửi lại sau ít phút."
+        )
 
-        # 4. Yêu cầu cho AI Thư ký
-        prompt = """
-        Bạn là một Thư ký cuộc họp chuyên nghiệp. Hãy lắng nghe file âm thanh cuộc họp này và thực hiện các nhiệm vụ sau:
-        1. Gỡ băng chính xác toàn bộ nội dung cuộc họp (Transcript).
-        2. Tóm tắt tổng quan nội dung cuộc họp.
-        3. Rút ra các quyết định chính và điểm quan trọng.
-        4. Trích xuất danh sách các việc cần làm (Action Items), bao gồm người thực hiện và hạn chót (nếu có).
-        Response phải tuân theo chính xác định dạng JSON schema được yêu cầu.
-        """
+    return RuntimeError(f"Lỗi Gemini: {text}")
 
-        response_text = None
-        last_exception = None
+
+def _generate_with_retry(
+    *,
+    contents: Any,
+    config: types.GenerateContentConfig,
+) -> Any:
+    """
+    Gọi Gemini với retry có kiểm soát.
+    Không retry các lỗi cấu hình/401/403/404/400.
+    """
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(GEMINI_MAX_RETRIES + 1):
+        try:
+            return client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=config,
+            )
+        except Exception as exc:
+            last_exc = exc
+
+            if not _is_retryable(exc) or attempt >= GEMINI_MAX_RETRIES:
+                raise _friendly_gemini_error(exc) from exc
+
+            # Nếu đã biết quota là quota theo ngày thì retry cũng không giúp.
+            if _looks_like_daily_quota(_exception_text(exc)):
+                raise _friendly_gemini_error(exc) from exc
+
+            wait_seconds = _retry_after_seconds(exc, attempt)
+            time.sleep(wait_seconds)
+
+    raise _friendly_gemini_error(last_exc)  # pragma: no cover
+
+
+class MeetingService:
+    PRIMARY_MODEL = GEMINI_MODEL
+
+    @staticmethod
+    def process_audio_meeting(file_path: str, mime_type: str) -> MeetingSummaryResponse:
+        uploaded_file = None
 
         try:
-            print(f"--> Đang gửi yêu cầu phân tích tới model: {MeetingService.PRIMARY_MODEL}")
-            
-            # Thử tối đa 3 lần nếu gặp lỗi quá tải tạm thời (503)
-            for attempt in range(1, 4):
-                try:
-                    response = client.models.generate_content(
-                        model=MeetingService.PRIMARY_MODEL,
-                        contents=[file_info, prompt],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=MeetingSummaryResponse,
-                            temperature=0.2,
-                        ),
-                    )
-                    response_text = response.text
-                    print(f"==> Thành công xử lý cuộc họp!")
-                    break
-                except ServerError as e:
-                    last_exception = e
-                    if e.code == 503:
-                        print(f"⚠️ Server đang quá tải (503). Thử lại lần {attempt}/3 sau 3 giây...")
-                        time.sleep(3)
-                    else:
-                        break
-                except APIError as e:
-                    last_exception = e
-                    print(f"⚠️ Lỗi API: {e.message}")
-                    break
+            uploaded_file = client.files.upload(
+                file=file_path,
+                config=types.UploadFileConfig(mime_type=mime_type),
+            )
 
-            if not response_text:
-                raise Exception(f"Không thể xử lý cuộc họp. Lỗi từ Gemini API: {last_exception}")
+            # Chờ Gemini xử lý file audio thành ACTIVE.
+            max_wait = 180
+            started = time.time()
+
+            while getattr(uploaded_file.state, "name", "") == "PROCESSING":
+                if time.time() - started > max_wait:
+                    raise RuntimeError(
+                        "Gemini xử lý file âm thanh quá lâu. "
+                        "File gốc vẫn được giữ để bạn gửi lại."
+                    )
+
+                time.sleep(2)
+                uploaded_file = client.files.get(name=uploaded_file.name)
+
+            state_name = getattr(uploaded_file.state, "name", "")
+            if state_name == "FAILED":
+                raise RuntimeError(
+                    "Gemini không thể đọc file âm thanh. "
+                    "Hãy thử lại bằng file MP3, M4A hoặc WAV."
+                )
+
+            prompt = """
+Bạn là thư ký cuộc họp tiếng Việt.
+
+Hãy phân tích TOÀN BỘ file âm thanh cuộc họp và trả về ĐÚNG JSON theo schema được cung cấp.
+
+Yêu cầu:
+1. transcript:
+   - Chép lại nội dung cuộc họp càng đầy đủ càng tốt.
+   - Giữ nguyên tiếng Việt, tên người, số liệu và thuật ngữ khi nghe được.
+   - Không tự bịa nội dung không có trong audio.
+
+2. overview:
+   - Tóm tắt ngắn gọn nội dung và mục đích chính của cuộc họp.
+
+3. key_points:
+   - Liệt kê các nội dung quan trọng, quyết định, vấn đề, kết luận.
+   - Chỉ lấy thông tin có trong cuộc họp.
+
+4. action_items:
+   - Liệt kê công việc cần thực hiện sau cuộc họp.
+   - task: công việc.
+   - assignee: người/nhóm phụ trách nếu xác định được, nếu không ghi "Chưa chỉ định".
+   - deadline: hạn hoàn thành nếu xác định được, nếu không ghi "Chưa rõ".
+
+Nếu âm thanh không đủ rõ để xác định người hoặc thời hạn, không được đoán.
+Trả về JSON hợp lệ, không thêm Markdown hay giải thích bên ngoài JSON.
+"""
+
+            response_config = types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=MeetingSummaryResponse,
+                temperature=0.1,
+            )
+
+            # Serialize các request Gemini để giảm burst 429 trên cùng Render instance.
+            with _GEMINI_LOCK:
+                response = _generate_with_retry(
+                    contents=[uploaded_file, prompt],
+                    config=response_config,
+                )
+
+            text = getattr(response, "text", None)
+            if not text:
+                raise RuntimeError("Gemini trả về kết quả rỗng.")
+
+            # Một số SDK/model có thể trả JSON kèm whitespace; pydantic xử lý được.
+            return MeetingSummaryResponse.model_validate_json(text)
+
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise _friendly_gemini_error(exc) from exc
 
         finally:
-            # 5. Luôn dọn dẹp file tạm trên Cloud Gemini
-            try:
-                client.files.delete(name=uploaded_file.name)
-            except Exception as e:
-                print(f"Lỗi dọn dẹp file tạm Gemini: {e}")
-
-        # 6. Parse và validate dữ liệu trả về theo Schema
-        return MeetingSummaryResponse.model_validate_json(response_text)
+            if uploaded_file is not None:
+                try:
+                    client.files.delete(name=uploaded_file.name)
+                except Exception:
+                    # Không để lỗi xóa file tạm làm hỏng kết quả đã tạo.
+                    pass
 
     @staticmethod
-    async def ask_meeting_assistant(transcript: str, question: str) -> str:
-        """
-        Hỏi đáp dựa trên biên bản cuộc họp.
-        """
-        prompt = f"""
-        Bạn là trợ lý cuộc họp "Thư ký cuộc họp". Dưới đây là biên bản cuộc họp:
-        ---
-        {transcript}
-        ---
-        Dựa vào biên bản cuộc họp trên, hãy trả lời câu hỏi sau của người dùng một cách chính xác và ngắn gọn:
-        Câu hỏi: {question}
-        """
+    def ask_meeting_assistant(transcript: str, question: str) -> str:
+        if not transcript.strip():
+            raise RuntimeError("Cuộc họp chưa có transcript để hỏi đáp.")
 
-        response = client.models.generate_content(
-            model=MeetingService.PRIMARY_MODEL,
-            contents=prompt,
+        prompt = f"""
+Bạn là trợ lý cho một cuộc họp.
+
+Chỉ trả lời dựa trên transcript bên dưới.
+Nếu transcript không đủ thông tin để trả lời, hãy nói rõ "Không tìm thấy thông tin này trong transcript", không tự bịa.
+
+TRANSCRIPT:
+{transcript}
+
+CÂU HỎI:
+{question}
+"""
+
+        response_config = types.GenerateContentConfig(
+            temperature=0.2,
         )
-        return response.text
+
+        try:
+            with _GEMINI_LOCK:
+                response = _generate_with_retry(
+                    contents=prompt,
+                    config=response_config,
+                )
+
+            answer = getattr(response, "text", None)
+            if not answer:
+                raise RuntimeError("Gemini trả về câu trả lời rỗng.")
+            return answer.strip()
+
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise _friendly_gemini_error(exc) from exc
